@@ -1,0 +1,383 @@
+import random
+import time
+import threading
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import asyncio
+import queue
+import uvicorn
+
+app = FastAPI()
+
+def randomFloat(max_val, min_val, decimal_places):
+    """Genera un numero float casuale tra max_val e min_val con decimal_places cifre decimali."""
+    r = random.uniform(min_val, max_val)
+    r = round(r, decimal_places)
+    return r
+
+class CoolantSystem:
+    def __init__(self, initial_temperature=20.0, coolant_volume=10.0, specific_heat_capacity=4.186, time_step=5.0):
+        # Parametri fisici del liquido refrigerante
+        self.ambient_temperature = initial_temperature  # °C
+        self.coolant_temperature = initial_temperature  # °C
+        self.coolant_volume = coolant_volume  # litri
+        self.specific_heat_capacity = specific_heat_capacity  # J/g°C
+        self.coolant_mass = coolant_volume * 1000  # g (densità ≈ 1 g/cm³, tipica dell'acqua)
+        
+        # Parametri del sistema di raffreddamento
+        self.flow_rate = 0.0  # litri/minuto
+        self.heat_transfer_coefficient = 500.0  # W/m²K 
+        self.heat_exchange_area = 0.5  # m² (area stimata per una segatrice)
+        self.pump_power = 0.0  # W (potenza pompa)
+        
+        # Parametri temporali
+        self.time_step = time_step  # secondi (allineato all'intervallo di simulazione)
+
+    def calculate_heat_transfer(self, machine_heat_load):
+        """Calcola il trasferimento di calore e la variazione di temperatura."""
+        delta_temperature = self.coolant_temperature - self.ambient_temperature
+        heat_dissipated = (
+            self.heat_transfer_coefficient * self.heat_exchange_area * delta_temperature
+        )
+        energy_balance = machine_heat_load - heat_dissipated
+        temperature_change = (
+            (energy_balance * self.time_step) / (self.coolant_mass * self.specific_heat_capacity)
+        )
+        return temperature_change
+    
+    def update_coolant(self, machine_heat_load):
+        """Aggiorna lo stato del liquido refrigerante."""
+        delta_temp = self.calculate_heat_transfer(machine_heat_load)
+        self.coolant_temperature += delta_temp
+        self.coolant_temperature = max(self.ambient_temperature, self.coolant_temperature)
+        if self.coolant_temperature > 60.0:
+            print(f"ALLARME: Temperatura refrigerante elevata: {self.coolant_temperature:.2f}°C")
+
+    def set_flow_rate(self, flow_rate):
+        """Imposta la portata del liquido refrigerante."""
+        self.flow_rate = max(0.0, flow_rate)
+        self.pump_power = self.flow_rate * 10.0  # 10 W per litro/minuto
+        self.heat_transfer_coefficient = 500.0 + 50.0 * (self.flow_rate / 10.0)  # W/m²K
+
+    def get_status(self):
+        """Restituisce lo stato attuale del sistema."""
+        return {
+            "coolant_temperature": self.coolant_temperature,
+            "flow_rate": self.flow_rate,
+            "pump_power": self.pump_power,
+            "heat_transfer_coefficient": self.heat_transfer_coefficient
+        }
+
+class BandSaw:
+    def __init__(self):
+        self.is_on = False
+        self.is_cutting = False
+        self.is_automatic = False
+        self.proximity_sensor = False
+        self.ambient_temperature = 15.0
+        self.blade_temperature = self.ambient_temperature
+        self.machine_temperature = self.ambient_temperature
+        self.consumption = 0.0
+        self.speed = 0.0
+        self.max_speed = 0.0
+        self.tear = 0.0
+        self.blade_height = 120
+        self.shape = "circle"  # Default shape per la simulazione
+        # Sistema di raffreddamento integrato
+        self.coolant_system = CoolantSystem(initial_temperature=self.ambient_temperature, time_step=1.0)
+        # Capacità termiche (J/°C)
+        self.machine_thermal_capacity = 50000  # Stima per macchina (es. 100 kg * 500 J/kg°C)
+        self.blade_thermal_capacity = 5000  # Stima per lama (es. 10 kg * 500 J/kg°C)
+        # Coefficienti di trasferimento termico al refrigerante (W/°C)
+        self.h_A_machine = 15.0  # Macchina-refrigerante
+        self.h_A_blade = 8.0  # Lama-refrigerante
+
+    # Getters
+    def getIsOn(self):
+        return self.is_on
+
+    def getIsCutting(self):
+        return self.is_cutting
+    
+    def getIsAutomatic(self):
+        return self.is_automatic
+
+    def getProximity(self):
+        return self.proximity_sensor
+
+    def getConsumption(self):
+        return self.consumption
+    
+    def getBladeTemp(self):
+        return self.blade_temperature
+    
+    def getMachineTemp(self):
+        return self.machine_temperature
+    
+    def getAmbientTemp(self):
+        return self.ambient_temperature
+    
+    def getSpeed(self):
+        return self.speed
+    
+    def getTear(self):
+        return self.tear
+
+    # Other methods
+    def startCutting(self):
+        self.is_cutting = not self.is_cutting
+        if not self.is_cutting:
+            self.raiseBlade()
+
+    def redButton(self):
+        self.is_on = not self.is_on
+        if not self.is_on:
+            self.is_cutting = False
+            self.speed = 0
+            self.consumption = 0
+        
+    def setMaxSpeed(self, speed):
+        self.max_speed = speed
+
+    def varyMachineTemp(self):
+        if self.is_on:
+            var = randomFloat(0.1, 1, 2)  # Base variation
+            speed_factor = self.speed / 100  # Factor proportional to speed (normalized)
+            var = var * (1 + speed_factor/2)
+            self.machine_temperature += var
+        elif self.machine_temperature > self.ambient_temperature:  # Machine not in use: cools down
+            var = -randomFloat(0.1, 0.5, 2)
+            self.machine_temperature += var
+            self.machine_temperature = max(self.ambient_temperature, self.machine_temperature)  # Don't go below ambient temperature
+        else:
+            var = 0  # Keep stable
+            self.machine_temperature += var
+
+    def varyBladeTemp(self):
+        if self.is_on and self.is_cutting:
+            var = randomFloat(0.3, 2, 2)
+            speed_factor = self.speed / 100
+            var = var * (1 + speed_factor)
+            var = var * self.shapeModifier()
+            self.blade_temperature += var
+        elif self.blade_temperature > self.ambient_temperature:
+            var = -randomFloat(0.1, 0.5, 2)
+            self.blade_temperature += var
+            self.blade_temperature = max(self.ambient_temperature, self.blade_temperature)
+    
+    def consumeBlade(self):
+        if self.is_cutting:
+            base = 0.5
+            variable = self.speed * 0.03
+            self.tear += base + variable + randomFloat(-0.1, 0.1, 2) * self.shapeModifier()
+
+    def consumptionMachine(self):
+        if self.is_on:
+            base = 0.9 + 0.1 #consumo base + pompa di raffreddamento
+            self.consumption = base + randomFloat(-0.02, 0.05, 2) 
+            if self.is_cutting:
+                self.consumption = base + 2 + (randomFloat(-0.1, 1, 2) * self.shapeModifier())
+        else:
+            self.consumption = 0.0  # Consumo nullo quando spenta
+            
+    def replaceBlade(self):
+        self.blade_temperature = self.ambient_temperature
+        self.tear = 0
+    
+    def vibrate(self):
+        vib = randomFloat(-1, 1, 4)
+        return round(vib * self.speed * self.shapeModifier(), 4)
+    
+    def vibrateArray(self):
+        array = []
+        for i in range(50):
+            array.append(self.vibrate())
+        return array
+
+    def varySpeed(self):
+        if self.is_on and self.is_cutting:
+            if self.speed >= self.max_speed:
+                self.speed = self.max_speed
+            else:
+                var = randomFloat(5, 10, 2)
+                var = var - (1 * self.shapeModifier())
+                self.speed += var
+        else:
+            if self.speed <= 0:
+                self.speed = 0
+            else:
+                var = -randomFloat(10, 20, 2)
+                self.speed += var
+                self.speed = max(self.speed, 0)
+
+    def lowerBlade(self):
+        self.blade_height = self.blade_height - randomFloat(10, 5, 1)
+        self.blade_height = max(self.blade_height, 0)
+
+    def raiseBlade(self):
+        self.blade_height = 120
+
+    def operateBlade(self):
+        if self.blade_height == 0:
+            self.raiseBlade()
+        else:
+            self.lowerBlade()
+
+    def circleModifier(self):
+        mod = 0
+        if self.blade_height <= 100:
+            mod = np.cos(((self.blade_height * 0.9) * 2) - 90) * 2
+        return 1 + mod
+
+    def rectangleModifier(self):
+        mod = 0
+        if self.blade_height <= 100:
+            mod = 2
+        return 1 + mod
+    
+    def shapeModifier(self):
+        if self.shape == "circle":
+            return self.circleModifier()
+        elif self.shape == "rectangle":
+            return self.rectangleModifier()
+        return 1  # Default se shape non è definito
+
+    def calculate_heat_load(self):
+        """Calcola il calore generato e trasferito al refrigerante."""
+        if self.is_on:
+            # Calore totale generato dal consumo (W)
+            heat_generated = self.consumption * 1000 * 0.3  # 30% del consumo in kW → W
+            energy_generated = heat_generated * self.coolant_system.time_step  # J
+            
+            # Distribuzione del calore
+            if self.is_cutting:
+                energy_generated_machine = energy_generated * 0.8  # 80% alla macchina
+                energy_generated_blade = energy_generated * 0.2    # 20% alla lama
+            else:
+                energy_generated_machine = energy_generated
+                energy_generated_blade = 0.0
+
+            # Calore trasferito al refrigerante (J)
+            energy_transferred_to_coolant_machine = self.h_A_machine * (self.machine_temperature - self.coolant_system.coolant_temperature) * self.coolant_system.time_step
+            energy_transferred_to_coolant_blade = self.h_A_blade * (self.blade_temperature - self.coolant_system.coolant_temperature) * self.coolant_system.time_step
+            
+            # Aggiornamento temperature macchina e lama
+            self.machine_temperature += (energy_generated_machine - energy_transferred_to_coolant_machine) / self.machine_thermal_capacity
+            self.blade_temperature += (energy_generated_blade - energy_transferred_to_coolant_blade) / self.blade_thermal_capacity
+            
+            # Limiti minimi
+            self.machine_temperature = max(self.ambient_temperature, self.machine_temperature)
+            self.blade_temperature = max(self.ambient_temperature, self.blade_temperature)
+            
+            # Calore totale trasferito al refrigerante (W)
+            total_energy_to_coolant = energy_transferred_to_coolant_machine + energy_transferred_to_coolant_blade
+            machine_heat_load = total_energy_to_coolant / self.coolant_system.time_step  # Convertito in W
+            return max(0.0, machine_heat_load)  # Non negativo
+        return 0.0
+
+    def work(self):
+        self.consumeBlade()
+        self.vibrate()
+        self.consumptionMachine()
+        self.varySpeed()
+        self.varyBladeTemp()
+        self.varyMachineTemp()
+        self.operateBlade()
+        
+        # Gestione del sistema di raffreddamento
+        if self.is_cutting:
+            self.coolant_system.set_flow_rate(10.0)  # Pompa attiva durante il taglio
+        else:
+            self.coolant_system.set_flow_rate(0.0)  # Pompa spenta
+        
+        # Calcolo e trasferimento del calore al refrigerante
+        heat_load = self.calculate_heat_load()
+        self.coolant_system.update_coolant(heat_load)
+
+    def get_data(self):
+        """Return simulation data as a dictionary for JSON serialization."""
+        coolant_status = self.coolant_system.get_status()
+        return {
+            "is_on": self.getIsOn(),
+            "is_cutting": self.getIsCutting(),
+            "speed": self.getSpeed(),
+            "blade_temp": round(self.getBladeTemp(), 3),
+            "machine_temp": round(self.getMachineTemp(), 3),
+            "consumption": round(self.getConsumption(), 3),
+            "coolant_temp": round(coolant_status["coolant_temperature"], 3),
+            "vibrations": self.vibrateArray(),
+            "tear": round(self.getTear(), 3)
+        }
+
+class BandSawManager:
+    def __init__(self):
+        self.band_saw = BandSaw()
+
+manager = BandSawManager()
+clients = []
+
+# Gestione della connessione WebSocket
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    clients.append(websocket)
+    try:
+        while True:
+            # Invia lo stato della macchina ogni 1/2 secondo
+            data = manager.band_saw.get_data()
+            await websocket.send_json(data)
+            await asyncio.sleep(0.5)
+    except WebSocketDisconnect:
+        clients.remove(websocket)
+        print("Client disconnesso")
+
+# Funzione per eseguire il server
+def run_server():
+    uvicorn.run(app, host="10.0.20.118", port=8000)
+
+def start_simulation(coda):
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+
+    while True:
+        try:
+            try:
+                comando, valore = coda.get(timeout=1)
+                coda.task_done()
+            except queue.Empty:
+                comando, valore = None, None
+            if comando == "macchina_accesa":
+                if not manager.band_saw.is_on:
+                    manager.band_saw.redButton()
+                manager.band_saw.setMaxSpeed(valore)
+            elif comando == "macchina_spenta":
+                if manager.band_saw.is_on:
+                    manager.band_saw.redButton()
+            elif comando == "lama_attiva":
+                if not manager.band_saw.is_cutting:
+                    manager.band_saw.startCutting()
+            elif comando == "lama_spenta":
+                if manager.band_saw.is_cutting:
+                    manager.band_saw.startCutting()
+            elif comando == "cambio_lama":
+                manager.band_saw.replaceBlade()
+            elif comando == "velocita":
+                manager.band_saw.setMaxSpeed(valore)
+
+            # Esegui sempre la simulazione, anche da spenta
+            manager.band_saw.work()
+            data = manager.band_saw.get_data()
+            print(f"Simulazione: {data}")
+            time.sleep(1)
+        except queue.Empty:
+            # Anche senza comandi, continua a simulare e inviare
+            manager.band_saw.work()
+            data = manager.band_saw.get_data()
+            print(f"Simulazione: {data}")
+            time.sleep(1)
+
+if __name__ == "__main__":
+    coda = queue.Queue()
+    sim_thread = threading.Thread(target=start_simulation, args=(coda,), daemon=True)
+    sim_thread.start()
+    sim_thread.join()
